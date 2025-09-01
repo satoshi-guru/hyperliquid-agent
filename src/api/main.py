@@ -4,13 +4,14 @@ import json
 import time
 import math
 import threading
-import coloredlogs
+import coloredlogs # type: ignore
 
 from decimal import Decimal, ROUND_UP, ROUND_DOWN, getcontext
 
-from fastapi import FastAPI, BackgroundTasks
-from swarm import Agent, Swarm
-from clients.hyperliquid import HyperliquidClient
+from fastapi import FastAPI, BackgroundTasks # type: ignore
+from swarm import Agent, Swarm # type: ignore
+from src.clients.hyperliquid import HyperliquidClient
+
 
 # ---------- Logging ----------
 coloredlogs.install()
@@ -197,9 +198,23 @@ def execute_trades(trade_decisions, open_positions):
 
         # TP/SL nach Ziel/Risiko
         equity, free_coll = get_equity_and_free_collateral()
-        take_profit_price = tp_price_for_target_profit_usdc(entry_price, position_size, TARGET_PROFIT_USDC)
-        stop_loss_price   = sl_price_for_equity_risk(entry_price, position_size, equity)
-        logger.info(f"📊 Setting TP: {take_profit_price}, SL: {stop_loss_price} for {asset}")
+        # TP/SL nach Ziel/Risiko – abhängig von der Seite (buy=LONG, sell=SHORT)
+        take_profit_price = tp_price_for_target_profit_usdc(entry_price, position_size, TARGET_PROFIT_USDC, decision)
+        stop_loss_price   = sl_price_for_equity_risk(entry_price, position_size, equity, decision)
+        logger.info(f"📊 Setting TP: {take_profit_price}, SL: {stop_loss_price} for {asset} ({decision.upper()})")
+
+                # Sicherheitskorridor: min. 5 Cent Abstand zum Entry
+        cent = Decimal("0.05")
+        if decision == "buy":  # LONG
+            if take_profit_price <= entry_price:
+                take_profit_price = (entry_price + cent).quantize(cent)
+            if stop_loss_price >= entry_price:
+                stop_loss_price = (entry_price - cent).quantize(cent)
+        else:                  # SHORT
+            if take_profit_price >= entry_price:
+                take_profit_price = (entry_price - cent).quantize(cent)
+            if stop_loss_price <= entry_price:
+                stop_loss_price = (entry_price + cent).quantize(cent)
 
         # Gegensätzliche Position schließen
         if decision == "sell" and position_side == "long":
