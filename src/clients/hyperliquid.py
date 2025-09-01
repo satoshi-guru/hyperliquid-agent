@@ -1,4 +1,4 @@
-import ccxt
+import ccxt # type: ignore
 import time
 import math
 import logging
@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 class HyperliquidClient:
     """Handles spot trading for BTC, ETH, and SOL using CCXT with Hyperliquid."""
 
-    def __init__(self, testnet=True):
+    def __init__(self, testnet=False):
         self.wallet = settings.HYPERLIQUID_WALLET_ADDRESS
         self.secret = settings.HYPERLIQUID_PRIVATE_KEY
         self.testnet = testnet

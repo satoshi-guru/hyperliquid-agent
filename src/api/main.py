@@ -353,7 +353,7 @@ async def add_asset(asset: str):
         return {"status": f"Added {formatted_asset} to watchlist"}
     return {"error": f"Asset {formatted_asset} is not tradable on Hyperliquid"}
 
-@app.post("/remove-asset/{asset}")
+@app.post("/remove-asset/{asset:path}")
 async def remove_asset(asset: str):
     """Entfernt ein Asset aus der Watchlist."""
     global watchlist

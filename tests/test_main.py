@@ -1,76 +1,78 @@
-import json
-import time
 import pytest
-from unittest.mock import MagicMock, patch
+from urllib.parse import quote
 from fastapi.testclient import TestClient
-from api.main import app, execute_trades, trading_loop, hyperliquid
+from src.api.main import app, execute_trades
+from unittest.mock import patch
 
-# ✅ Initialize test client
+# FastAPI TestClient
 client = TestClient(app)
 
-
-# ✅ TEST API ENDPOINTS
+# ✅ API ENDPOINTS
 @pytest.mark.parametrize("endpoint", [
     "/status",
     "/watchlist",
     "/trades",
     "/open-positions",
-    "/open-orders"
+    "/open-orders",
 ])
 def test_get_endpoints(endpoint):
-    """Test GET endpoints return a 200 response and valid JSON."""
-    response = client.get(endpoint)
-    assert response.status_code == 200
-    assert response.headers["content-type"] == "application/json"
+    """Alle GET-Endpunkte liefern 200 + JSON."""
+    r = client.get(endpoint)
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("application/json")
 
 def test_stop_trading():
-    """Test stopping the trading bot."""
-    response = client.post("/stop")
-    assert response.status_code == 200
-    assert response.json()["status"] in ["Trading bot stopped", "Trading bot is not running"]
-
+    """POST /stop beendet Trading Bot oder gibt 'not running'."""
+    r = client.post("/stop")
+    assert r.status_code == 200
+    assert r.json()["status"] in ["Trading bot stopped", "Trading bot is not running"]
 
 def test_add_remove_asset():
-    """Test adding and removing an asset from the watchlist."""
-    asset = "DOGE"
-    response = client.post(f"/add-asset/{asset}")
-    assert response.status_code == 200
+    """
+    Asset zur Watchlist hinzufügen und wieder entfernen.
+    Mit {asset:path} KEIN URL-Encoding nötig (und auch nicht gewünscht).
+    """
+    base = "DOGE"
+    # add -> erstellt "DOGE/USDC:USDC" in der Watchlist
+    r = client.post(f"/add-asset/{base}")
+    assert r.status_code == 200
+    assert "Added" in r.json().get("status", "")
 
-    response = client.post(f"/remove-asset/{asset}")
-    assert response.status_code == 200
+    # remove -> exakt der gleiche String mit echtem Slash
+    full_symbol = f"{base}/USDC:USDC"
+    r = client.post(f"/remove-asset/{full_symbol}")
+    assert r.status_code == 200
 
 
-# ✅ TEST TRADE EXECUTION LOGIC
-@pytest.fixture
-def mock_hyperliquid():
-    """Mock Hyperliquid API client for testing trade execution."""
-    with patch("api.main.hyperliquid") as mock:
-        mock.exchange.fetch_ticker.return_value = {"last": "100.0"}  # Fake price
+# ✅ TRADE EXECUTION
+def test_execute_trades_buy_and_sell():
+    """
+    Trade-Logik mit garantiert gemocktem hyperliquid
+    (expliziter Patch hier → unabhängig von globaler Fixture).
+    """
+    with patch("src.api.main.hyperliquid") as mock:
+        mock.exchange.fetch_ticker.return_value = {"last": "100.0"}
         mock.place_order.return_value = {"status": "ok", "order_id": "123"}
-        yield mock
 
+        trade_decisions = {"ETH/USDC:USDC": "buy", "BTC/USDC:USDC": "sell"}
+        open_positions = {
+            "ETH/USDC:USDC": {"side": "long", "contracts": "1.0", "entryPrice": "2000"},
+            "BTC/USDC:USDC": {"side": "short", "contracts": "0.5", "entryPrice": "80000"},
+        }
 
-def test_execute_trades(mock_hyperliquid):
-    """Test the trade execution function."""
-    trade_decisions = {"ETH/USDC:USDC": "buy", "BTC/USDC:USDC": "sell"}
-    open_positions = {
-        "ETH/USDC:USDC": {"side": "long", "contracts": "1.0", "entryPrice": "2000"},
-        "BTC/USDC:USDC": {"side": "short", "contracts": "0.5", "entryPrice": "80000"}
-    }
+        result = execute_trades(trade_decisions, open_positions)
+        assert isinstance(result, list)
+        assert len(result) > 0  # mindestens 1 Order platziert
 
-    result = execute_trades(trade_decisions, open_positions)
-    assert isinstance(result, list)
-    assert len(result) > 0
+def test_execute_trades_with_no_open_positions():
+    """Trade-Logik ohne bestehende Positionen."""
+    with patch("src.api.main.hyperliquid") as mock:
+        mock.exchange.fetch_ticker.return_value = {"last": "100.0"}
+        mock.place_order.return_value = {"status": "ok", "order_id": "123"}
 
+        trade_decisions = {"ETH/USDC:USDC": "buy"}
+        open_positions = {}
 
-def test_execute_trades_with_no_open_positions(mock_hyperliquid):
-    """Test execute_trades when there are no open positions."""
-    trade_decisions = {"ETH/USDC:USDC": "buy"}
-    open_positions = {}  # No open positions
-
-    result = execute_trades(trade_decisions, open_positions)
-    assert isinstance(result, list)
-    assert len(result) > 0  # Expect at least one trade to execute
-
-if __name__ == "__main__":
-    pytest.main()
+        result = execute_trades(trade_decisions, open_positions)
+        assert isinstance(result, list)
+        assert len(result) > 0
