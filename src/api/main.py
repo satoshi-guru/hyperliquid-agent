@@ -6,46 +6,146 @@ import math
 import threading
 import coloredlogs
 
-import decimal
-from decimal import Decimal, ROUND_UP, ROUND_DOWN
+from decimal import Decimal, ROUND_UP, ROUND_DOWN, getcontext
 
 from fastapi import FastAPI, BackgroundTasks
 from swarm import Agent, Swarm
 from clients.hyperliquid import HyperliquidClient
 
-# Initialize logging
+# ---------- Logging ----------
 coloredlogs.install()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize FastAPI
+# ---------- Decimal-Genauigkeit ----------
+getcontext().prec = 28
+
+# ---------- FastAPI ----------
 app = FastAPI(title="Hyperliquid Trading Bot API")
 
-# Initialize Hyperliquid client
-hyperliquid = HyperliquidClient(testnet=True)
-
-# Initialize Swarm client
+# ---------- Clients ----------
+hyperliquid = HyperliquidClient(testnet=False)
 swarm_client = Swarm()
 
-# Track running state
-running = False
+# ---------- Zustände ----------
+running = False        # nur für /status
+stop_event = threading.Event()
+
 watchlist = set(["BTC/USDC:USDC", "ETH/USDC:USDC", "SOL/USDC:USDC"])
 executed_trades_log = []
 
-# Risk Assessment Agent
+# ---------- Konfiguration / Parameter ----------
+# Gebühren (ohne Rebate; bei dir 0,0432% Maker / 0,0864% Taker; bei Bedarf anpassen)
+MAKER_BPS = Decimal("0.0432")
+TAKER_BPS = Decimal("0.0864")
+MAKER_RATE = MAKER_BPS / Decimal("100")
+TAKER_RATE = TAKER_BPS / Decimal("100")
+
+# Ziel & Risiko
+TARGET_PROFIT_USDC = Decimal("0.50")      # fester Netto-TP je Trade
+PER_TRADE_EQUITY_RISK = Decimal("0.02")   # max. 2% von Gesamt-Equity pro Trade
+
+# LLM-Kosten / Kadenz
+PAUSE_UTILIZATION = Decimal("0.80")       # ab 80% Kapitalbindung: LLM Calls pausieren
+IDLE_ACTIVE_SEC = 5                       # Poll-Intervall wenn aktiv
+IDLE_PAUSED_SEC = 30                      # Poll-Intervall bei Pause
+
+# ---------- Swarm-Agents ----------
 risk_assessment_agent = Agent(
     name="Risk-Assessor",
     instructions="Analyze risk scores for given crypto assets. Score from 0-100 (lower is better).",
 )
 
-# Trade Execution Agent
 trade_execution_agent = Agent(
     name="Trade-Executor",
     instructions="Decide trades based on risk scores. Buy if <40, Sell if >60, Hold otherwise.",
 )
 
+# ---------- Helfer ----------
+
+def round_price_to_cent(p: Decimal) -> Decimal:
+    return p.quantize(Decimal("0.01"), rounding=ROUND_UP)
+
+def get_equity_and_free_collateral() -> tuple[Decimal, Decimal]:
+    """
+    Versucht Equity & Free Collateral aus ccxt Balance zu lesen.
+    Fällt robust zurück, falls Schema anders ist.
+    """
+    try:
+        bal = hyperliquid.exchange.fetch_balance()
+        total = bal.get("total", {})
+        free = bal.get("free", {})
+        # bevorzugt USDC / USD / info-Felder
+        equity = Decimal(str(
+            total.get("USDC") or total.get("USD")
+            or bal.get("info", {}).get("equity") or "0"
+        ))
+        free_collateral = Decimal(str(
+            free.get("USDC") or free.get("USD")
+            or bal.get("info", {}).get("freeCollateral") or "0"
+        ))
+        if equity <= 0:
+            # letzter Fallback: nicht pausieren
+            return Decimal("1"), Decimal("1")
+        return equity, free_collateral
+    except Exception as e:
+        logger.warning(f"⚠️ fetch_balance failed: {e}")
+        return Decimal("1"), Decimal("1")
+
+def utilization(equity: Decimal, free_collateral: Decimal) -> Decimal:
+    used = equity - free_collateral
+    if equity <= 0:
+        return Decimal("0")
+    u = used / equity
+    return max(Decimal("0"), min(Decimal("1"), u))
+
+def tp_price_for_target_profit_usdc(entry_px: Decimal, size: Decimal, target_usdc: Decimal) -> Decimal:
+    """
+    Netto-Ziel:
+      (tp - entry)*size  -  fee_open(entry,taker)  -  fee_close(tp,maker)  = target_usdc
+
+    fee_open = TAKER_RATE * entry * size
+    fee_close = MAKER_RATE * tp * size   (TP als Limit → Maker)
+
+    => tp*(1 - MAKER_RATE) = entry*(1 + TAKER_RATE) + target_usdc/size
+    """
+    if size <= 0:
+        return entry_px
+    denom = (Decimal("1") - MAHER_RATE) if (MAKER_RATE := MAKER_RATE) else (Decimal("1") - MAKER_RATE)  # noqa (pyright)
+    # obiger Trick bewahrt die Variable in manchen Lintern; inhaltlich bleibt MAKER_RATE
+    tp_raw = (entry_px * (Decimal("1") + TAKER_RATE) + (target_usdc / size)) / (Decimal("1") - MAKER_RATE)
+    return round_price_to_cent(tp_raw)
+
+def sl_price_for_equity_risk(entry_px: Decimal, size: Decimal, equity_usdc: Decimal) -> Decimal:
+    """
+    Verlust-Cap inkl. Fees:
+      (entry - sl)*size  +  fee_open(entry,taker)  +  fee_close(sl,taker)  <= cap
+
+    cap = PER_TRADE_EQUITY_RISK * equity_usdc
+    fee_open = TAKER_RATE * entry * size
+    fee_close = TAKER_RATE * sl * size  (SL als Market → Taker)
+
+    Umgestellt nach sl:
+      sl = [ cap - entry*size*(1 + TAKER_RATE) ] / [ size*(TAKER_RATE - 1) ]
+    """
+    cap = PER_TRADE_EQUITY_RISK * equity_usdc
+    den = size * (TAKER_RATE - Decimal("1"))
+    if size <= 0 or den == 0:
+        # Fallback: eng unter Entry
+        return (entry_px * Decimal("0.99")).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    num = cap - entry_px * size * (Decimal("1") + TAKER_RATE)
+    sl = num / den
+    return sl.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+# ---------- Trading ----------
+
 def execute_trades(trade_decisions, open_positions):
-    """Executes trades while ensuring orders meet Hyperliquid's $20 minimum, managing TP/SL, and shorting when needed."""
+    """
+    Führt Trades aus:
+      - respektiert $20 Mindest-Nominal
+      - nutzt TP=+0.50 USDC (netto) und SL=max 2% Equity
+      - schließt gegensätzliche Positionen, öffnet neue mit Brackets
+    """
     global executed_trades_log
     executed_trades = []
 
@@ -58,81 +158,68 @@ def execute_trades(trade_decisions, open_positions):
             logger.info(f"Skipping {asset}: No action needed ({decision})")
             continue
 
-        # ✅ Fetch latest price
+        # Preis holen
         try:
             ticker = hyperliquid.exchange.fetch_ticker(asset)
-            latest_price = Decimal(str(ticker["last"]))  # Ensure Decimal precision
+            latest_price = Decimal(str(ticker["last"]))
         except Exception as e:
             logger.error(f"❌ Error fetching price for {asset}: {e}")
             continue
 
-        # ✅ Ensure minimum trade value of $20
+        # Mindestgröße (Nominal ≥ 20 USDC)
         min_trade_size = (Decimal("20") / latest_price).quantize(Decimal("0.000001"), rounding=ROUND_UP)
         logger.info(f"ℹ️ Calculated min trade size for {asset}: {min_trade_size} (latest price: {latest_price})")
 
-        # ✅ Initialize TP & SL correctly
+        # Positionserkennung
         if asset in open_positions:
             position = open_positions[asset]
-            position_side = position["side"]
-            position_size = Decimal(str(position["contracts"]))
-            entry_price = Decimal(str(position["entryPrice"]))
+            position_side = position.get("side", "none")
+            position_size = Decimal(str(position.get("contracts", "0")))
+            entry_price = Decimal(str(position.get("entryPrice", latest_price)))
         else:
-            # If no open position, set entry price to latest price
             position_side = "none"
             position_size = min_trade_size
             entry_price = latest_price
 
-        # **Fix TP & SL Calculation to avoid exceeding 80% limit**
-        take_profit_price = (entry_price * Decimal("1.20")).quantize(Decimal("0.01"), rounding=ROUND_UP)
-        stop_loss_price = (entry_price * Decimal("0.80")).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-
+        # TP/SL nach Ziel/Risiko
+        equity, free_coll = get_equity_and_free_collateral()
+        take_profit_price = tp_price_for_target_profit_usdc(entry_price, position_size, TARGET_PROFIT_USDC)
+        stop_loss_price   = sl_price_for_equity_risk(entry_price, position_size, equity)
         logger.info(f"📊 Setting TP: {take_profit_price}, SL: {stop_loss_price} for {asset}")
 
-        # ✅ Close Long Position on Sell
+        # Gegensätzliche Position schließen
         if decision == "sell" and position_side == "long":
-            logger.info(f"⚠️ Closing long position on {asset}.")
-            order = hyperliquid.place_order(
-                asset, "sell", float(position_size), float(latest_price),
-                take_profit_price, stop_loss_price
-            )
+            logger.info(f"⚠️ Closing LONG on {asset}.")
+            order = hyperliquid.place_order(asset, "sell", float(position_size), float(latest_price),
+                                            take_profit=take_profit_price, stop_loss=stop_loss_price)
             executed_trades.append(order)
-            continue  # Skip new trade if closing position
+            continue
 
-        # ✅ Close Short Position on Buy
         if decision == "buy" and position_side == "short":
-            logger.info(f"⚠️ Closing short position on {asset}.")
-            order = hyperliquid.place_order(
-                asset, "buy", float(position_size), float(latest_price),
-                take_profit_price, stop_loss_price
-            )
+            logger.info(f"⚠️ Closing SHORT on {asset}.")
+            order = hyperliquid.place_order(asset, "buy", float(position_size), float(latest_price),
+                                            take_profit=take_profit_price, stop_loss=stop_loss_price)
             executed_trades.append(order)
-            continue  # Skip new trade if closing position
+            continue
 
-        # ✅ Open New Short Position if Selling
+        # Neue Short-/Long-Position, falls keine offen
         if decision == "sell" and position_side == "none":
-            logger.info(f"🛑 Opening new SHORT position on {asset}.")
-            order = hyperliquid.place_order(
-                asset, "sell", float(min_trade_size), float(latest_price),
-                take_profit_price, stop_loss_price
-            )
+            logger.info(f"🛑 Opening new SHORT on {asset}.")
+            order = hyperliquid.place_order(asset, "sell", float(min_trade_size), float(latest_price),
+                                            take_profit=take_profit_price, stop_loss=stop_loss_price)
             executed_trades.append(order)
             continue
 
-        # ✅ Open New Long Position if Buying
         if decision == "buy" and position_side == "none":
-            logger.info(f"📈 Opening new LONG position on {asset}.")
-            order = hyperliquid.place_order(
-                asset, "buy", float(min_trade_size), float(latest_price),
-                take_profit_price, stop_loss_price
-            )
+            logger.info(f"📈 Opening new LONG on {asset}.")
+            order = hyperliquid.place_order(asset, "buy", float(min_trade_size), float(latest_price),
+                                            take_profit=take_profit_price, stop_loss=stop_loss_price)
             executed_trades.append(order)
             continue
 
-        # ✅ Place New Orders if No Existing Position
-        order = hyperliquid.place_order(
-            asset, decision, float(min_trade_size), float(latest_price),
-            take_profit_price, stop_loss_price
-        )
+        # Falls bereits Position existiert und Entscheidung gleichgerichtet → optional skalieren
+        order = hyperliquid.place_order(asset, decision, float(min_trade_size), float(latest_price),
+                                        take_profit=take_profit_price, stop_loss=stop_loss_price)
         if order:
             logger.info(f"✅ Executed {decision.upper()} order for {min_trade_size} {asset} at {latest_price}")
             executed_trades.append(order)
@@ -143,134 +230,135 @@ def execute_trades(trade_decisions, open_positions):
     return executed_trades
 
 def trading_loop():
-    """Main trading loop: fetch market data, assess risk (including open positions), and execute trades."""
+    """
+    Hauptloop:
+      - holt Marktdaten & Positionen
+      - pausiert LLM bei hoher Utilization (Kosten sparen)
+      - nutzt stop_event statt time.sleep für sauberes Stoppen
+    """
     global running
-    while running:
+    running = True
+    stop_event.clear()
+
+    while not stop_event.is_set():
         logger.info("\n---- Running Trading Cycle ----")
 
-        # 1️⃣ Fetch Market Data & Open Positions
+        # 1) Daten holen
         market_data = {asset: hyperliquid.get_market_data(asset) for asset in watchlist}
         open_positions = hyperliquid.get_open_positions()
 
-        # 2️⃣ Merge Market Data & Open Positions for Risk Assessment
-        risk_input = {"market_data": market_data, "open_positions": open_positions}
-        # logger.info(f"Risk Assessment Input: {json.dumps(risk_input, indent=4)}")
-        # 3️⃣ Send Data to Risk Assessment Agent
-        risk_response = swarm_client.run(
-            agent=risk_assessment_agent,
-            messages=[{"role": "user", "content": f"Analyze risk for {json.dumps(risk_input)}"}],
-        )
-        risk_scores = risk_response.messages[-1]["content"]
-        logger.info(f"Risk Scores: {risk_scores}")
+        # 2) Utilization prüfen
+        equity, free_coll = get_equity_and_free_collateral()
+        util = utilization(equity, free_coll)
+        if util >= PAUSE_UTILIZATION:
+            logger.info(f"⏸️ Utilization {util*100:.1f}% ≥ {PAUSE_UTILIZATION*100:.0f}% → Pause (nur Exits)")
+            # Hier könntest du optional Exit-Management pflegen, ohne LLM zu fragen.
+            stop_event.wait(IDLE_PAUSED_SEC)
+            continue
 
-        # 4️⃣ Trade Execution Decision
-        trade_response = swarm_client.run(
-            agent=trade_execution_agent,
-            messages=[{"role": "user", "content": f"Make trade decisions for risk: {risk_scores}"}],
-        )
-
-        # Ensure response is a dictionary (parse JSON if necessary)
+        # 3) Risk & Decision nur wenn nicht pausiert
         try:
-            trade_decisions = json.loads(trade_response.messages[-1]["content"])
-        except json.JSONDecodeError:
-            logger.warning("⚠️ Model response was not valid JSON. Falling back to manual parsing.")
-            trade_decisions = {
-                asset: "buy" if asset.split("/")[0] in trade_response.messages[-1]["content"] else "hold"
-                for asset in watchlist
-            }
+            risk_input = {"market_data": market_data, "open_positions": open_positions}
+            risk_response = swarm_client.run(
+                agent=risk_assessment_agent,
+                messages=[{"role": "user", "content": f"Analyze risk for {json.dumps(risk_input)}"}],
+            )
+            risk_scores = risk_response.messages[-1]["content"]
+            logger.info(f"Risk Scores: {risk_scores}")
 
-        logger.info(f"Trade Decisions (Parsed): {trade_decisions}")
+            trade_response = swarm_client.run(
+                agent=trade_execution_agent,
+                messages=[{"role": "user", "content": f"Make trade decisions for risk: {risk_scores}"}],
+            )
+            try:
+                trade_decisions = json.loads(trade_response.messages[-1]["content"])
+            except json.JSONDecodeError:
+                logger.warning("⚠️ Model response was not valid JSON. Falling back to manual parsing.")
+                trade_decisions = {
+                    asset: "buy" if asset.split("/")[0] in trade_response.messages[-1]["content"] else "hold"
+                    for asset in watchlist
+                }
+            logger.info(f"Trade Decisions (Parsed): {trade_decisions}")
 
-        # 5️⃣ Execute Trades (Now Considering Open Positions)
+        except Exception as e:
+            logger.error(f"LLM error: {e}")
+            trade_decisions = {a: "hold" for a in watchlist}
+
+        # 4) Trades ausführen
         execute_trades(trade_decisions, open_positions)
 
-        # 6️⃣ Sleep for Next Cycle
-        logger.info("Waiting 20 seconds before next cycle...\n")
-        time.sleep(20)
+        # 5) Stop-aware warten
+        logger.info("Waiting for next cycle...")
+        stop_event.wait(IDLE_ACTIVE_SEC)
+
+    running = False
+    logger.info("✅ trading_loop stopped cleanly.")
+
+# ---------- API ----------
 
 @app.post("/start")
 def start_trading(background_tasks: BackgroundTasks):
-    """Starts the trading bot in a background thread."""
-    global running
+    """Startet den Trading-Bot im Hintergrund-Thread."""
     if not running:
-        running = True
+        stop_event.clear()
         background_tasks.add_task(trading_loop)
         return {"status": "Trading bot started"}
     return {"status": "Trading bot already running"}
 
-
 @app.post("/stop")
 def stop_trading():
-    """Stops the trading bot."""
-    global running
+    """Stoppt den Trading-Bot sauber."""
     if running:
-        running = False
-        return {"status": "Trading bot stopped"}
+        stop_event.set()
+        return {"status": "Trading bot stopping"}
     return {"status": "Trading bot is not running"}
-
 
 @app.post("/add-asset/{asset}")
 async def add_asset(asset: str):
-    """Adds an asset to the watchlist if it exists in Hyperliquid."""
+    """Fügt ein Asset der Watchlist hinzu, wenn es auf Hyperliquid existiert."""
     global watchlist
-
-    # Format asset symbol correctly
     formatted_asset = f"{asset.upper()}/USDC:USDC"
-
-    # Check if asset exists on Hyperliquid
     market_data = hyperliquid.get_market_data(formatted_asset)
-
     if market_data:
         watchlist.add(formatted_asset)
         return {"status": f"Added {formatted_asset} to watchlist"}
-
     return {"error": f"Asset {formatted_asset} is not tradable on Hyperliquid"}
-
 
 @app.post("/remove-asset/{asset}")
 async def remove_asset(asset: str):
-    """Removes an asset from the watchlist."""
+    """Entfernt ein Asset aus der Watchlist."""
     global watchlist
     if asset in watchlist:
         watchlist.remove(asset)
         return {"status": f"Removed {asset} from watchlist"}
     return {"error": "Asset not in watchlist"}
 
-
 @app.get("/watchlist")
 async def get_watchlist():
-    """Returns the current watchlist of assets."""
     return {"watchlist": list(watchlist)}
-
 
 @app.get("/trades")
 async def get_trades():
-    """Returns executed trades."""
     return {"executed_trades": executed_trades_log}
-
 
 @app.get("/status")
 async def get_status():
-    """Returns the current status of the trading bot."""
     return {"running": running, "watchlist": list(watchlist)}
 
-### ✅ FETCH OPEN POSITIONS
 @app.get("/open-positions")
 def get_open_positions():
-    """Fetches open positions from Hyperliquid."""
+    """Positions-API (kompakt)."""
     try:
         positions = hyperliquid.exchange.fetch_positions()
-        formatted_positions = {p["symbol"]: p for p in positions if p["contracts"] > 0}
+        formatted_positions = {p["symbol"]: p for p in positions if p.get("contracts", 0) > 0}
         return {"open_positions": formatted_positions}
     except Exception as e:
         logger.error(f"Error fetching open positions: {e}")
         return {"error": "Failed to fetch open positions"}
 
-
-### ✅ FETCH OPEN ORDERS
 @app.get("/open-orders")
 def get_open_orders():
-    """Fetches open orders from Hyperliquid."""
+    """Offene Orders abrufen."""
     try:
         orders = hyperliquid.exchange.fetch_open_orders()
         return {"open_orders": orders}
