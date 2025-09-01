@@ -99,43 +99,57 @@ def utilization(equity: Decimal, free_collateral: Decimal) -> Decimal:
     u = used / equity
     return max(Decimal("0"), min(Decimal("1"), u))
 
-def tp_price_for_target_profit_usdc(entry_px: Decimal, size: Decimal, target_usdc: Decimal) -> Decimal:
+def tp_price_for_target_profit_usdc(entry_px: Decimal, size: Decimal, target_usdc: Decimal, side: str) -> Decimal:
     """
-    Netto-Ziel:
-      (tp - entry)*size  -  fee_open(entry,taker)  -  fee_close(tp,maker)  = target_usdc
-
-    fee_open = TAKER_RATE * entry * size
-    fee_close = MAKER_RATE * tp * size   (TP als Limit → Maker)
-
-    => tp*(1 - MAKER_RATE) = entry*(1 + TAKER_RATE) + target_usdc/size
+    Ziel: Netto-TP in USDC erreichen, inkl. Fees.
+    LONG:
+      (tp - entry)*size - taker*entry*size - maker*tp*size = target
+      => tp = [ entry*(1 + taker) + target/size ] / (1 - maker)
+    SHORT:
+      (entry - tp)*size - taker*entry*size - maker*tp*size = target
+      => tp = [ entry*(1 - taker) - target/size ] / (1 + maker)
     """
     if size <= 0:
         return entry_px
-    denom = (Decimal("1") - MAHER_RATE) if (MAKER_RATE := MAKER_RATE) else (Decimal("1") - MAKER_RATE)  # noqa (pyright)
-    # obiger Trick bewahrt die Variable in manchen Lintern; inhaltlich bleibt MAKER_RATE
-    tp_raw = (entry_px * (Decimal("1") + TAKER_RATE) + (target_usdc / size)) / (Decimal("1") - MAKER_RATE)
-    return round_price_to_cent(tp_raw)
 
-def sl_price_for_equity_risk(entry_px: Decimal, size: Decimal, equity_usdc: Decimal) -> Decimal:
+    maker = MAKER_RATE
+    taker = TAKER_RATE
+
+    if side == "buy":  # LONG
+        tp_raw = (entry_px * (Decimal("1") + taker) + (target_usdc / size)) / (Decimal("1") - maker)
+    else:              # "sell" = SHORT
+        tp_raw = (entry_px * (Decimal("1") - taker) - (target_usdc / size)) / (Decimal("1") + maker)
+
+    return tp_raw.quantize(Decimal("0.01"), rounding=ROUND_UP)
+
+def sl_price_for_equity_risk(entry_px: Decimal, size: Decimal, equity_usdc: Decimal, side: str) -> Decimal:
     """
-    Verlust-Cap inkl. Fees:
-      (entry - sl)*size  +  fee_open(entry,taker)  +  fee_close(sl,taker)  <= cap
-
-    cap = PER_TRADE_EQUITY_RISK * equity_usdc
-    fee_open = TAKER_RATE * entry * size
-    fee_close = TAKER_RATE * sl * size  (SL als Market → Taker)
-
-    Umgestellt nach sl:
-      sl = [ cap - entry*size*(1 + TAKER_RATE) ] / [ size*(TAKER_RATE - 1) ]
+    Cap: max PER_TRADE_EQUITY_RISK * equity_usdc netto Verlust, inkl. Taker-Fees.
+    LONG (SL < entry):
+      loss = (entry - sl)*size + taker*entry*size + taker*sl*size <= cap
+      => sl = [ entry*size*(1 + taker) - cap ] / [ size*(1 - taker) ]
+    SHORT (SL > entry):
+      loss = (sl - entry)*size + taker*entry*size + taker*sl*size <= cap
+      => sl = [ cap + entry*size*(1 - taker) ] / [ size*(1 + taker) ]
     """
+    taker = TAKER_RATE
     cap = PER_TRADE_EQUITY_RISK * equity_usdc
-    den = size * (TAKER_RATE - Decimal("1"))
-    if size <= 0 or den == 0:
-        # Fallback: eng unter Entry
-        return (entry_px * Decimal("0.99")).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-    num = cap - entry_px * size * (Decimal("1") + TAKER_RATE)
-    sl = num / den
-    return sl.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+    if size <= 0:
+        return entry_px
+
+    if side == "buy":  # LONG
+        den = size * (Decimal("1") - taker)
+        if den <= 0:
+            return (entry_px * Decimal("0.99")).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        sl = (entry_px * size * (Decimal("1") + taker) - cap) / den
+        return sl.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    else:              # "sell" = SHORT
+        den = size * (Decimal("1") + taker)
+        if den <= 0:
+            return (entry_px * Decimal("1.01")).quantize(Decimal("0.01"), rounding=ROUND_UP)
+        sl = (cap + entry_px * size * (Decimal("1") - taker)) / den
+        return sl.quantize(Decimal("0.01"), rounding=ROUND_UP)
 
 # ---------- Trading ----------
 
