@@ -362,108 +362,137 @@ def execute_trades(trade_decisions, open_positions):
 
     return executed_trades
 
+# ---------- Trading Loop ----------
 def trading_loop():
-    """Main trading loop: fetch market data, assess risk (including open positions), and execute trades."""
+    """
+    Main trading loop:
+      - holt Marktdaten & Positionen
+      - fasst Positionen zusammen (Summary)
+      - berechnet Utilization aus (Equity, Free Collateral)
+      - blockt neue Entries, wenn Utilization ≥ 80% (nur Exits erlaubt)
+    """
     global running
+    beat = 0
+    running = True
 
-    CYCLE_SEC = 16 * 60  # 16 Minuten zwischen den Zyklen
-
+    logger.info("🧵 trading_loop thread started (heartbeat 0)")
     while running:
-        logger.info("\n---- Running Trading Cycle ----")
-
-        # 1) Daten holen
-        market_data = {asset: hyperliquid.get_market_data(asset) for asset in watchlist}
-        open_positions = hyperliquid.get_open_positions()
-
-        # 2) Summary & Utilization
         try:
+            beat += 1
+            logger.info(f"\n---- Running Trading Cycle (beat {beat}) ----")
+
+            # 1) Daten holen
+            market_data = {asset: hyperliquid.get_market_data(asset) for asset in watchlist}
+            open_positions = hyperliquid.get_open_positions()
+
+            # 2) Summary & Utilization
             summarize_positions(open_positions)
-        except Exception as e:
-            logger.warning(f"⚠️ summarize_positions failed: {e}")
 
-        equity, free_coll, source = get_equity_and_free_collateral(hyperliquid)
-        util = calc_utilization(equity, free_coll)
-
-        if equity is not None and free_coll is not None and util is not None:
-            logger.info(
-                f"💼 Equity: {equity:.2f} | Free Collateral: {free_coll:.2f} | "
-                f"Utilization: {util*100:.1f}% (source={source})"
-            )
-        else:
-            logger.warning("⚠️ Utilization unknown (no balance data). New entries will be allowed cautiously.")
-
-        # 3) Wenn Auslastung ≥ 80% → nur Exits erlauben
-        pause_opens = (util is not None and util >= 0.80)
-        if pause_opens:
-            logger.info("⏸️ Utilization ≥ 80% → Pause (nur Exits)")
-            # Optional: hier könntest du z.B. TPs enger nachziehen etc.
-
-        # 4) Risk Assessment (unverändert)
-        risk_input = {"market_data": market_data, "open_positions": open_positions}
-        risk_response = swarm_client.run(
-            agent=risk_assessment_agent,
-            messages=[{"role": "user", "content": f"Analyze risk for {json.dumps(risk_input)}"}],
-        )
-        risk_scores = risk_response.messages[-1]["content"]
-        logger.info(f"Risk Scores: {risk_scores}")
-
-        trade_response = swarm_client.run(
-            agent=trade_execution_agent,
-            messages=[{"role": "user", "content": f"Make trade decisions for risk: {risk_scores}"}],
-        )
-        try:
-            trade_decisions = json.loads(trade_response.messages[-1]["content"])
-        except json.JSONDecodeError:
-            logger.warning("⚠️ Model response was not valid JSON. Falling back to manual parsing.")
-            trade_decisions = {
-                asset: "buy" if asset.split("/")[0] in trade_response.messages[-1]["content"] else "hold"
-                for asset in watchlist
-            }
-
-        logger.info(f"Trade Decisions (Parsed): {trade_decisions}")
-
-        # 5) Wenn pausiert, filtern wir Neueinträge raus (nur Exits durchlassen)
-        if pause_opens:
-            filtered = {}
-            for asset, decision in trade_decisions.items():
-                pos = open_positions.get(asset)
-                if not pos:
-                    # keine offene Position → skip (würde neuen Entry erzeugen)
-                    filtered[asset] = "hold"
+            # Robust: akzeptiere 2- oder 3-tuple Rückgabe (equity, free[, source])
+            source = "unknown"
+            bal = get_equity_and_free_collateral()
+            if isinstance(bal, tuple):
+                if len(bal) >= 2:
+                    equity, free_coll = bal[0], bal[1]
+                    if len(bal) >= 3:
+                        source = bal[2]
                 else:
-                    # Exits erlauben: wenn Entscheidung gegen die aktuelle Richtung geht
-                    side = (pos.get("side") or "").lower()
-                    if (side == "long" and decision == "sell") or (side == "short" and decision == "buy"):
-                        filtered[asset] = decision
+                    equity = free_coll = None
+            else:
+                equity = free_coll = None
+
+            util = calc_utilization(equity, free_coll)
+
+            if equity is not None and free_coll is not None and util is not None:
+                logger.info(
+                    f"💼 Equity: {equity:.2f} | Free Collateral: {free_coll:.2f} | "
+                    f"Utilization: {util*100:.1f}% (source={source})"
+                )
+            else:
+                logger.warning("⚠️ Utilization unknown (no balance data). New entries will be allowed cautiously.")
+
+            # 3) Wenn Auslastung ≥ 80% → nur Exits erlauben
+            pause_opens = (util is not None and util >= 0.80)
+            if pause_opens:
+                logger.info("⏸️ Utilization ≥ 80% → Pause (nur Exits)")
+
+            # 4) Risk Assessment (nur wenn nicht pausiert → spart LLM-Kosten)
+            trade_decisions = {a: "hold" for a in watchlist}
+            if not pause_opens:
+                risk_input = {"market_data": market_data, "open_positions": open_positions}
+                risk_response = swarm_client.run(
+                    agent=risk_assessment_agent,
+                    messages=[{"role": "user", "content": f"Analyze risk for {json.dumps(risk_input)}"}],
+                )
+                risk_scores = risk_response.messages[-1]["content"]
+                logger.info(f"Risk Scores: {risk_scores}")
+
+                trade_response = swarm_client.run(
+                    agent=trade_execution_agent,
+                    messages=[{"role": "user", "content": f"Make trade decisions for risk: {risk_scores}"}],
+                )
+                try:
+                    trade_decisions = json.loads(trade_response.messages[-1]["content"])
+                except json.JSONDecodeError:
+                    logger.warning("⚠️ Model response was not valid JSON. Falling back to manual parsing.")
+                    trade_decisions = {
+                        asset: "buy" if asset.split("/")[0] in trade_response.messages[-1]["content"] else "hold"
+                        for asset in watchlist
+                    }
+
+            logger.info(f"Trade Decisions (Parsed): {trade_decisions}")
+
+            # 5) Wenn pausiert, filtern wir Neueinträge raus (nur Exits durchlassen)
+            if pause_opens:
+                filtered = {}
+                for asset, decision in trade_decisions.items():
+                    pos = open_positions.get(asset)
+                    if not pos:
+                        filtered[asset] = "hold"  # neuer Entry wäre nötig → blocken
                     else:
-                        filtered[asset] = "hold"
-            trade_decisions = filtered
-            logger.info(f"🔒 Openings blocked (≥80%). Decisions now: {trade_decisions}")
+                        side = (pos.get("side") or "").lower()
+                        if (side == "long" and decision == "sell") or (side == "short" and decision == "buy"):
+                            filtered[asset] = decision  # Exit erlauben
+                        else:
+                            filtered[asset] = "hold"
+                trade_decisions = filtered
+                logger.info(f"🔒 Openings blocked (≥80%). Decisions now: {trade_decisions}")
 
-        # 6) Trades ausführen
-        execute_trades(trade_decisions, open_positions)
+            # 6) Trades ausführen
+            execute_trades(trade_decisions, open_positions)
 
-        # 7) Sleep (16 Minuten)
-        logger.info(f"Waiting {CYCLE_SEC} seconds before next cycle...\n")
-        time.sleep(CYCLE_SEC)
+            # 7) Sleep
+            logger.info("⏱️ Waiting 20s before next cycle...")
+            time.sleep(20)
+
+        except Exception as e:
+            logger.exception(f"💥 trading_loop crashed: {e}")
+            running = False
+            break
+
+    logger.info("✅ trading_loop stopped cleanly.")
+
 
 # ---------- API ----------
 
 @app.post("/start")
 def start_trading(background_tasks: BackgroundTasks):
-    """Startet den Trading-Bot im Hintergrund-Thread."""
-    if not running:
-        stop_event.clear()
-        background_tasks.add_task(trading_loop)
-        return {"status": "Trading bot started"}
-    return {"status": "Trading bot already running"}
+    global running
+    if running:
+        logger.info("ℹ️ /start called but bot already running.")
+        return {"status": "Trading bot already running"}
+    running = True
+    logger.info("🚀 Starting trading_loop in background...")
+    background_tasks.add_task(trading_loop)
+    return {"status": "Trading bot started"}
 
 @app.post("/stop")
 def stop_trading():
-    """Stoppt den Trading-Bot sauber."""
+    global running
     if running:
-        stop_event.set()
-        return {"status": "Trading bot stopping"}
+        logger.info("🛑 Stop requested.")
+        running = False
+        return {"status": "Trading bot stopped"}
     return {"status": "Trading bot is not running"}
 
 @app.post("/add-asset/{asset}")
