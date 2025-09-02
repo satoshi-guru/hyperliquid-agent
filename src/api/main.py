@@ -12,6 +12,7 @@ from fastapi import FastAPI, BackgroundTasks # type: ignore
 from swarm import Agent, Swarm # type: ignore
 from src.clients.hyperliquid import HyperliquidClient
 
+from typing import Dict, Tuple, Optional #for helpers
 
 # ---------- Logging ----------
 coloredlogs.install()
@@ -61,6 +62,109 @@ trade_execution_agent = Agent(
     name="Trade-Executor",
     instructions="Decide trades based on risk scores. Buy if <40, Sell if >60, Hold otherwise.",
 )
+
+# === ADD: helpers (z.B. direkt unter den Agent-Definitionen) =================
+
+def get_equity_and_free_collateral(hyperliquid) -> Tuple[Optional[float], Optional[float], str]:
+    """
+    Versucht echte Werte aus fetch_balance() zu ziehen.
+    Fallback: konservative Approximation aus offenen Positionen.
+    Returns: (equity, free_collateral, source)
+    """
+    # 1) Primärquelle: fetch_balance().info hat je nach CCXT-Version diese Keys:
+    #    - 'accountValue' (≈ Equity)
+    #    - 'freeCollateral'
+    try:
+        bal = hyperliquid.exchange.fetch_balance()
+        info = bal.get("info", {}) or {}
+        # Hyperliquid-typische Felder (können je nach CCXT-Version variieren)
+        equity = (
+            float(info.get("accountValue"))
+            if info.get("accountValue") is not None
+            else float(bal.get("total", {}).get("USDC", 0.0))  # Fallback
+        )
+        free_coll = (
+            float(info.get("freeCollateral"))
+            if info.get("freeCollateral") is not None
+            else float(bal.get("free", {}).get("USDC", 0.0))   # Fallback
+        )
+        if equity and equity > 0:
+            return equity, max(free_coll, 0.0), "balance"
+    except Exception as e:
+        logger.debug(f"[util] fetch_balance fallback, reason: {e}")
+
+    # 2) Fallback: aus offenen Positionen konservativ abschätzen.
+    #    Idee: verwendete Margin ≈ Sum(|contracts * entryPrice| / max(leverage,1)).
+    #    Equity unbekannt → nehmen used_margin * 1.25 als grobe Obergrenze,
+    #    damit Utilization nicht zu optimistisch ist.
+    try:
+        open_positions = hyperliquid.get_open_positions()
+        used_margin = 0.0
+        for p in open_positions.values():
+            qty = float(p.get("contracts", 0) or 0)
+            entry = float(p.get("entryPrice", 0) or 0)
+            lev = float(p.get("leverage", 1) or 1) or 1
+            notional = abs(qty * entry)
+            used_margin += (notional / max(lev, 1.0))
+        if used_margin > 0:
+            equity = used_margin * 1.25   # konservativ
+            free_coll = max(equity - used_margin, 0.0)
+            return equity, free_coll, "approx"
+    except Exception as e:
+        logger.debug(f"[util] approx fallback failed: {e}")
+
+    return None, None, "none"
+
+
+def calc_utilization(equity: Optional[float], free_coll: Optional[float]) -> Optional[float]:
+    if equity is None or equity <= 0 or free_coll is None:
+        return None
+    used = max(equity - free_coll, 0.0)
+    return min(max(used / equity, 0.0), 1.0)
+
+
+def summarize_positions(open_positions: Dict[str, Dict]) -> Dict[str, float]:
+    """
+    Loggt eine kompakte Übersicht und liefert Totals zurück.
+    Totals: positions, gross_notional, used_margin(est), unrealized_pnl(est)
+    """
+    totals = {
+        "positions": 0,
+        "gross_notional": 0.0,
+        "used_margin_est": 0.0,
+        "unrealized_pnl_est": 0.0,
+    }
+    if not open_positions:
+        logger.info("📭 No open positions.")
+        return totals
+
+    logger.info("— Positions Summary —")
+    logger.info(f"{'SYMBOL':<18} {'SIDE':<6} {'QTY':>10} {'ENTRY':>12} {'LEV':>6} {'NOTIONAL':>14} {'PnL':>10}")
+    for sym, p in open_positions.items():
+        side = (p.get("side") or "").upper()
+        qty = float(p.get("contracts") or 0)
+        entry = float(p.get("entryPrice") or 0)
+        lev = float(p.get("leverage") or 1)
+        pnl = float(p.get("unrealizedPnl") or 0)
+
+        notional = abs(qty * entry)
+        used_margin = notional / max(lev, 1.0)
+
+        totals["positions"] += 1
+        totals["gross_notional"] += notional
+        totals["used_margin_est"] += used_margin
+        totals["unrealized_pnl_est"] += pnl
+
+        logger.info(f"{sym:<18} {side:<6} {qty:>10.6f} {entry:>12.2f} {lev:>6.1f} {notional:>14.2f} {pnl:>10.2f}")
+
+    logger.info(
+        f"TOTALS → Positions: {totals['positions']} | "
+        f"Gross Notional: {totals['gross_notional']:.2f} | "
+        f"Used Margin(est): {totals['used_margin_est']:.2f} | "
+        f"Unrealized PnL(est): {totals['unrealized_pnl_est']:.2f}"
+    )
+    return totals
+# =============================================================================
 
 # ---------- Helfer ----------
 
@@ -259,69 +363,89 @@ def execute_trades(trade_decisions, open_positions):
     return executed_trades
 
 def trading_loop():
-    """
-    Hauptloop:
-      - holt Marktdaten & Positionen
-      - pausiert LLM bei hoher Utilization (Kosten sparen)
-      - nutzt stop_event statt time.sleep für sauberes Stoppen
-    """
+    """Main trading loop: fetch market data, assess risk (including open positions), and execute trades."""
     global running
-    running = True
-    stop_event.clear()
 
-    while not stop_event.is_set():
+    CYCLE_SEC = 16 * 60  # 16 Minuten zwischen den Zyklen
+
+    while running:
         logger.info("\n---- Running Trading Cycle ----")
 
         # 1) Daten holen
         market_data = {asset: hyperliquid.get_market_data(asset) for asset in watchlist}
         open_positions = hyperliquid.get_open_positions()
 
-        # 2) Utilization prüfen
-        equity, free_coll = get_equity_and_free_collateral()
-        util = utilization(equity, free_coll)
-        if util >= PAUSE_UTILIZATION:
-            logger.info(f"⏸️ Utilization {util*100:.1f}% ≥ {PAUSE_UTILIZATION*100:.0f}% → Pause (nur Exits)")
-            # Hier könntest du optional Exit-Management pflegen, ohne LLM zu fragen.
-            stop_event.wait(IDLE_PAUSED_SEC)
-            continue
-
-        # 3) Risk & Decision nur wenn nicht pausiert
+        # 2) Summary & Utilization
         try:
-            risk_input = {"market_data": market_data, "open_positions": open_positions}
-            risk_response = swarm_client.run(
-                agent=risk_assessment_agent,
-                messages=[{"role": "user", "content": f"Analyze risk for {json.dumps(risk_input)}"}],
-            )
-            risk_scores = risk_response.messages[-1]["content"]
-            logger.info(f"Risk Scores: {risk_scores}")
-
-            trade_response = swarm_client.run(
-                agent=trade_execution_agent,
-                messages=[{"role": "user", "content": f"Make trade decisions for risk: {risk_scores}"}],
-            )
-            try:
-                trade_decisions = json.loads(trade_response.messages[-1]["content"])
-            except json.JSONDecodeError:
-                logger.warning("⚠️ Model response was not valid JSON. Falling back to manual parsing.")
-                trade_decisions = {
-                    asset: "buy" if asset.split("/")[0] in trade_response.messages[-1]["content"] else "hold"
-                    for asset in watchlist
-                }
-            logger.info(f"Trade Decisions (Parsed): {trade_decisions}")
-
+            summarize_positions(open_positions)
         except Exception as e:
-            logger.error(f"LLM error: {e}")
-            trade_decisions = {a: "hold" for a in watchlist}
+            logger.warning(f"⚠️ summarize_positions failed: {e}")
 
-        # 4) Trades ausführen
+        equity, free_coll, source = get_equity_and_free_collateral(hyperliquid)
+        util = calc_utilization(equity, free_coll)
+
+        if equity is not None and free_coll is not None and util is not None:
+            logger.info(
+                f"💼 Equity: {equity:.2f} | Free Collateral: {free_coll:.2f} | "
+                f"Utilization: {util*100:.1f}% (source={source})"
+            )
+        else:
+            logger.warning("⚠️ Utilization unknown (no balance data). New entries will be allowed cautiously.")
+
+        # 3) Wenn Auslastung ≥ 80% → nur Exits erlauben
+        pause_opens = (util is not None and util >= 0.80)
+        if pause_opens:
+            logger.info("⏸️ Utilization ≥ 80% → Pause (nur Exits)")
+            # Optional: hier könntest du z.B. TPs enger nachziehen etc.
+
+        # 4) Risk Assessment (unverändert)
+        risk_input = {"market_data": market_data, "open_positions": open_positions}
+        risk_response = swarm_client.run(
+            agent=risk_assessment_agent,
+            messages=[{"role": "user", "content": f"Analyze risk for {json.dumps(risk_input)}"}],
+        )
+        risk_scores = risk_response.messages[-1]["content"]
+        logger.info(f"Risk Scores: {risk_scores}")
+
+        trade_response = swarm_client.run(
+            agent=trade_execution_agent,
+            messages=[{"role": "user", "content": f"Make trade decisions for risk: {risk_scores}"}],
+        )
+        try:
+            trade_decisions = json.loads(trade_response.messages[-1]["content"])
+        except json.JSONDecodeError:
+            logger.warning("⚠️ Model response was not valid JSON. Falling back to manual parsing.")
+            trade_decisions = {
+                asset: "buy" if asset.split("/")[0] in trade_response.messages[-1]["content"] else "hold"
+                for asset in watchlist
+            }
+
+        logger.info(f"Trade Decisions (Parsed): {trade_decisions}")
+
+        # 5) Wenn pausiert, filtern wir Neueinträge raus (nur Exits durchlassen)
+        if pause_opens:
+            filtered = {}
+            for asset, decision in trade_decisions.items():
+                pos = open_positions.get(asset)
+                if not pos:
+                    # keine offene Position → skip (würde neuen Entry erzeugen)
+                    filtered[asset] = "hold"
+                else:
+                    # Exits erlauben: wenn Entscheidung gegen die aktuelle Richtung geht
+                    side = (pos.get("side") or "").lower()
+                    if (side == "long" and decision == "sell") or (side == "short" and decision == "buy"):
+                        filtered[asset] = decision
+                    else:
+                        filtered[asset] = "hold"
+            trade_decisions = filtered
+            logger.info(f"🔒 Openings blocked (≥80%). Decisions now: {trade_decisions}")
+
+        # 6) Trades ausführen
         execute_trades(trade_decisions, open_positions)
 
-        # 5) Stop-aware warten
-        logger.info("Waiting for next cycle...")
-        stop_event.wait(IDLE_ACTIVE_SEC)
-
-    running = False
-    logger.info("✅ trading_loop stopped cleanly.")
+        # 7) Sleep (16 Minuten)
+        logger.info(f"Waiting {CYCLE_SEC} seconds before next cycle...\n")
+        time.sleep(CYCLE_SEC)
 
 # ---------- API ----------
 
