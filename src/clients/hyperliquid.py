@@ -141,8 +141,8 @@ class HyperliquidClient:
             else:
                 eff_price = round_price(Decimal(str(price)))
 
-            # Mindest-Nominalwert 20 USDC
-            min_trade_size = (Decimal("20") / eff_price).quantize(
+            # Mindest-Nominalwert 12 USDC
+            min_trade_size = (Decimal("12") / eff_price).quantize(
                 Decimal("0.000001"), rounding=ROUND_UP
             )
             requested = Decimal(str(amount))
