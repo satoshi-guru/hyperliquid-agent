@@ -1,4 +1,4 @@
-import pytest
+import pytest #type:ignore
 from unittest.mock import MagicMock, patch
 from src.clients.hyperliquid import HyperliquidClient
 

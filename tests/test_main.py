@@ -1,6 +1,6 @@
-import pytest
+import pytest #type:ignore
 from urllib.parse import quote
-from fastapi.testclient import TestClient
+from fastapi.testclient import TestClient #type:ignore
 from src.api.main import app, execute_trades
 from unittest.mock import patch
 
